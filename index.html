@@ -1,0 +1,1158 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Transistor Sim</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #18191b; color: white; font-family: sans-serif; }
+  #toolbar {
+    position: fixed; top: 0; left: 0; right: 0; height: 40px;
+    background: #303134; display: flex; align-items: center;
+    padding: 4px 8px; gap: 8px; z-index: 10;
+  }
+  #toolbar button {
+    background: #444; color: #eee; border: 1px solid #666;
+    padding: 4px 8px; cursor: pointer; font-size: 12px;
+  }
+  #toolbar button:hover { background: #555; }
+  #status { margin-left: auto; font-size: 11px; opacity: 0.8; }
+  #title {
+    position: fixed; top: 8px; right: 10px; font-size: 11px; opacity: 0.8;
+  }
+  canvas { position: fixed; top: 40px; left: 0; right: 0; bottom: 0; }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <button id="addNMOS">NMOS</button>
+  <button id="addPMOS">PMOS</button>
+  <button id="addInput">Input</button>
+  <button id="addResistor">Resistor</button>
+  <button id="deleteMode">Delete</button>
+  <button id="saveBtn">Save</button>
+  <button id="loadBtn">Load</button>
+  <button id="addVDD">VDD</button>
+	<button id="addGND">GND</button>
+  <span id="status">Nodes: 0</span>
+</div>
+<div id="title">Transistor Sim</div>
+
+<input type="file" id="fileInput" accept=".json" style="display:none">
+
+<canvas id="c"></canvas>
+
+<script>
+// grid
+const GRID = 20;
+function snap(v) { return Math.round(v / GRID) * GRID; }
+// ====== CAMERA ======
+let camX = 0, camY = 0, camScale = 1;
+const ZOOM_FACTOR = 1.1;
+function screenToWorld(x, y) {
+  return {
+    x: (x - camX) / camScale,
+    y: (y - camY) / camScale
+  };
+}
+// data
+class Node {
+  constructor() {
+    this.value = "X";
+    this.nextValue = "X";
+    this.x = 0;
+    this.y = 0;
+    this.isInput = false;
+    this.group = this;
+  }
+}
+
+function find(n) {
+  if (n.group !== n) n.group = find(n.group);
+  return n.group;
+}
+function merge(a, b) {
+  a = find(a);
+  b = find(b);
+  if (a !== b) b.group = a;
+}
+
+class Transistor {
+  constructor(type, g, s, d) {
+    this.type = type;
+    this.g = g; this.s = s; this.d = d;
+  }
+  isOn() {
+    let gv = find(this.g).value;
+    return (this.type === "nmos" && gv === "1") ||
+           (this.type === "pmos" && gv === "0");
+  }
+}
+
+class Resistor {
+  constructor(a, b) {
+    this.a = a;
+    this.b = b;
+  }
+}
+
+let nodes = [];
+let transistors = [];
+let resistors = [];
+let visuals = [];
+let wires = [];
+
+let deleteMode = false;
+let wiringStart = null;
+let wirePreviewPos = null;
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const statusEl = document.getElementById("status");
+
+let dragging = null;
+let dragDX = 0, dragDY = 0;
+
+let selection = new Set();
+let selectionRect = null;
+let lastMouse = { x: 0, y: 0 };
+
+let clipboard = null;
+
+let panning = false;
+let panStart = { x: 0, y: 0, camX: 0, camY: 0 };
+
+// visuals
+class TransistorVisual {
+  constructor(model, x, y) {
+    this.model = model;
+    this.x = snap(x);
+    this.y = snap(y);
+    this.updatePins();
+  }
+  updatePins() {
+    this.model.g.x = this.x - 30;
+    this.model.g.y = this.y;
+    this.model.s.x = this.x;
+    this.model.s.y = this.y - 20;
+    this.model.d.x = this.x;
+    this.model.d.y = this.y + 20;
+  }
+  contains(px, py) {
+    return px >= this.x - 20 && px <= this.x + 20 &&
+           py >= this.y - 10 && py <= this.y + 10;
+  }
+  getBounds() {
+    return { x1: this.x - 20, y1: this.y - 10, x2: this.x + 20, y2: this.y + 10 };
+  }
+  getNodes() {
+    return [this.model.g, this.model.s, this.model.d];
+  }
+  draw(ctx) {
+    // body
+    ctx.fillStyle = selection.has(this) ? "#aaf" : "#ddd";
+    ctx.fillRect(this.x - 20, this.y - 10, 40, 20);
+    ctx.strokeStyle = "#000000";
+    ctx.strokeRect(this.x - 20, this.y - 10, 40, 20);
+    // vertical line :p
+    ctx.beginPath();
+    ctx.moveTo(this.x, this.y - 10);
+    ctx.lineTo(this.x, this.y + 10);
+    ctx.stroke();
+    // arrow for PMOS
+    if (this.model.type === "pmos") {
+      ctx.beginPath();
+      ctx.moveTo(this.x - 4, this.y);
+      ctx.lineTo(this.x - 10, this.y - 4);
+      ctx.lineTo(this.x - 10, this.y + 4);
+      ctx.closePath();
+      ctx.fillStyle = "#000000";
+      ctx.fill();
+    }
+    // lables
+    ctx.fillStyle = "#FFFFFF";
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("G", this.model.g.x - 8, this.model.g.y - 4);
+    ctx.fillText("S", this.model.s.x, this.model.s.y - 6);
+    ctx.fillText("D", this.model.d.x, this.model.d.y + 12);
+    // wires
+    drawWire(ctx, this.model.g.x, this.model.g.y, this.x - 20, this.y);
+    drawWire(ctx, this.model.s.x, this.model.s.y, this.x, this.y - 10);
+    drawWire(ctx, this.model.d.x, this.model.d.y, this.x, this.y + 10);
+    // dots
+    drawNode(ctx, this.model.g);
+    drawNode(ctx, this.model.s);
+    drawNode(ctx, this.model.d);
+  }
+}
+
+class VDDNodeVisual {
+  constructor(n, x, y) {
+    this.n = n;
+    this.x = snap(x);
+    this.y = snap(y);
+    // node at end of prong
+    n.x = this.x + 40;
+    n.y = this.y + 20;
+    n.isInput = true;
+    n.value = "1";
+  }
+  updatePins() {
+    this.n.x = this.x + 40;
+    this.n.y = this.y + 20;
+  }
+  contains(px, py) {
+    return px >= this.x && px <= this.x + 40 &&
+           py >= this.y && py <= this.y + 40;
+  }
+  getBounds() {
+    return { x1: this.x, y1: this.y, x2: this.x + 40, y2: this.y + 40 };
+  }
+  getNodes() { return [this.n]; }
+  draw(ctx) {
+    // white-ish square
+    ctx.fillStyle = selection.has(this) ? "#f0f0f0" : "#fafafa";
+    ctx.fillRect(this.x, this.y, 40, 40);
+    ctx.strokeStyle = "#000";
+    ctx.strokeRect(this.x, this.y, 40, 40);
+    // bold green "1"
+    ctx.fillStyle = "#22aa22";  // light green
+    ctx.font = "bold 20px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("1", this.x + 20, this.y + 26);
+    // prong
+    ctx.strokeStyle = "#000";
+    ctx.beginPath();
+    ctx.moveTo(this.x + 40, this.y + 20);
+    ctx.lineTo(this.x + 50, this.y + 20);
+    ctx.stroke();
+    // node circle
+    drawNode(ctx, this.n);
+  }
+}
+
+class GNDNodeVisual {
+  constructor(n, x, y) {
+    this.n = n;
+    this.x = snap(x);
+    this.y = snap(y);
+    // node at end of prong
+    n.x = this.x + 40;
+    n.y = this.y + 20;
+    n.isInput = true;
+    n.value = "0";
+  }
+  updatePins() {
+    this.n.x = this.x + 40;
+    this.n.y = this.y + 20;
+  }
+  contains(px, py) {
+    return px >= this.x && px <= this.x + 40 &&
+           py >= this.y && py <= this.y + 40;
+  }
+  getBounds() {
+    return { x1: this.x, y1: this.y, x2: this.x + 40, y2: this.y + 40 };
+  }
+  getNodes() { return [this.n]; }
+  draw(ctx) {
+    // white-ish square
+    ctx.fillStyle = selection.has(this) ? "#f0f0f0" : "#fafafa";
+    ctx.fillRect(this.x, this.y, 40, 40);
+    ctx.strokeStyle = "#000";
+    ctx.strokeRect(this.x, this.y, 40, 40);
+    // bold dark green "0"
+    ctx.fillStyle = "#115511";  // dark green
+    ctx.font = "bold 20px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("0", this.x + 20, this.y + 26);
+    // prong
+    ctx.strokeStyle = "#000";
+    ctx.beginPath();
+    ctx.moveTo(this.x + 40, this.y + 20);
+    ctx.lineTo(this.x + 50, this.y + 20);
+    ctx.stroke();
+    // node circle
+    drawNode(ctx, this.n);
+  }
+}
+
+class InputNodeVisual {
+  constructor(n, x, y) {
+    this.n = n;
+    this.x = snap(x);
+    this.y = snap(y);
+    this.n.x = this.x;
+    this.n.y = this.y;
+    this.n.isInput = true;
+    this.n.value = "0";
+  }
+  contains(px, py) {
+    return Math.hypot(px - this.x, py - this.y) < 10;
+  }
+  getBounds() {
+    return { x1: this.x - 10, y1: this.y - 10, x2: this.x + 10, y2: this.y + 10 };
+  }
+  getNodes() {
+    return [this.n];
+  }
+  toggle() {
+    this.n.value = this.n.value === "0" ? "1" : "0";
+  }
+  draw(ctx) {
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, 8, 0, Math.PI * 2);
+    ctx.fillStyle = this.n.value === "1" ? "#6f6" : "#666";
+    if (selection.has(this)) ctx.fillStyle = "#8af";
+    ctx.fill();
+    ctx.strokeStyle = "#000";
+    ctx.stroke();
+    drawNode(ctx, this.n);
+  }
+}
+
+class ResistorVisual {
+  constructor(model, x, y) {
+    this.model = model;
+    this.x = snap(x);
+    this.y = snap(y);
+    this.updatePins();
+  }
+  updatePins() {
+    this.model.a.x = this.x - 15;
+    this.model.a.y = this.y;
+    this.model.b.x = this.x + 15;
+    this.model.b.y = this.y;
+  }
+  contains(px, py) {
+    return Math.abs(px - this.x) < 20 && Math.abs(py - this.y) < 10;
+  }
+  getBounds() {
+    return { x1: this.x - 20, y1: this.y - 10, x2: this.x + 20, y2: this.y + 10 };
+  }
+  getNodes() {
+    return [this.model.a, this.model.b];
+  }
+  draw(ctx) {
+    drawWire(ctx, this.model.a.x, this.model.a.y, this.model.b.x, this.model.b.y);
+    ctx.fillStyle = selection.has(this) ? "#fd8" : "#fc6";
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("R", this.x, this.y - 4);
+    drawNode(ctx, this.model.a);
+    drawNode(ctx, this.model.b);
+  }
+}
+
+// draw helpers
+function drawNode(ctx, n) {
+  let v = find(n).value;
+  ctx.fillStyle = v === "1" ? "#6f6" : v === "0" ? "#f66" : "#888";
+  ctx.beginPath();
+  ctx.arc(n.x, n.y, 3, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawWire(ctx, x1, y1, x2, y2) {
+  ctx.strokeStyle = "#aaa";
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.stroke();
+}
+
+// sim
+function simulate() {
+  for (let n of nodes) {
+    let root = find(n);
+    root.nextValue = root.isInput ? root.value : "X";
+  }
+  for (let t of transistors) {
+    if (!t.isOn()) continue;
+    let s = find(t.s);
+    let d = find(t.d);
+    if (s.value !== "X" && d.value === "X") d.nextValue = s.value;
+    if (d.value !== "X" && s.value === "X") s.nextValue = d.value;
+  }
+  for (let r of resistors) {
+    let a = find(r.a);
+    let b = find(r.b);
+    if (a.value !== "X" && b.value !== "X") {
+      // keep both
+    } else if (a.value !== "X" && b.value === "X") {
+      b.nextValue = a.value;
+    } else if (b.value !== "X" && a.value === "X") {
+      a.nextValue = b.value;
+    }
+  }
+  for (let n of nodes) {
+    let root = find(n);
+    root.value = root.nextValue;
+  }
+}
+
+// canvas + resize
+function resize() {
+  canvas.width = innerWidth;
+  canvas.height = innerHeight - 40;
+}
+resize();
+addEventListener("resize", resize);
+// hit tests
+function hitNodeAt(x, y) {
+  for (let v of visuals) {
+    if (v instanceof TransistorVisual) {
+      let g = v.model.g, s = v.model.s, d = v.model.d;
+      if (Math.hypot(x - g.x, y - g.y) < 8) return g;
+      if (Math.hypot(x - s.x, y - s.y) < 8) return s;
+      if (Math.hypot(x - d.x, y - d.y) < 8) return d;
+    }
+    if (v instanceof InputNodeVisual) {
+      if (Math.hypot(x - v.x, y - v.y) < 10) return v.n;
+    }
+	// VDD hit test
+	if (v instanceof VDDNodeVisual) {
+	  if (Math.hypot(x - v.n.x, y - v.n.y) < 4) return v.n;
+	}
+	// GND hit test
+	if (v instanceof GNDNodeVisual) {
+	  if (Math.hypot(x - v.n.x, y - v.n.y) < 4) return v.n;
+	}
+	// resistor hit test
+    if (v instanceof ResistorVisual) {
+      let a = v.model.a, b = v.model.b;
+      if (Math.hypot(x - a.x, y - a.y) < 8) return a;
+      if (Math.hypot(x - b.x, y - b.y) < 8) return b;
+    }
+  }
+  return null;
+}
+
+function hitVisualAt(x, y) {
+  for (let i = visuals.length - 1; i >= 0; i--) {
+    let v = visuals[i];
+    if (v.contains && v.contains(x, y)) return v;
+  }
+  return null;
+}
+
+function hitWireAt(x, y) {
+  for (let i = wires.length - 1; i >= 0; i--) {
+    let w = wires[i];
+    let x1 = w.a.x, y1 = w.a.y;
+    let x2 = w.b.x, y2 = w.b.y;
+    let A = x - x1;
+    let B = y - y1;
+    let C = x2 - x1;
+    let D = y2 - y1;
+    let dot = A*C + B*D;
+    let len = C*C + D*D;
+    if (len === 0) continue;
+    let t = Math.max(0, Math.min(1, dot / len));
+    let px = x1 + t * C;
+    let py = y1 + t * D;
+    if (Math.hypot(x - px, y - py) < 6) return i;
+  }
+  return -1;
+}
+
+// selection helpers
+function clearSelection() {
+  selection.clear();
+}
+function addToSelection(v) {
+  selection.add(v);
+}
+function toggleSelection(v) {
+  if (selection.has(v)) selection.delete(v);
+  else selection.add(v);
+}
+function selectionBounds() {
+  if (selection.size === 0) return null;
+  let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+  for (let v of selection) {
+    let b = v.getBounds();
+    x1 = Math.min(x1, b.x1);
+    y1 = Math.min(y1, b.y1);
+    x2 = Math.max(x2, b.x2);
+    y2 = Math.max(y2, b.y2);
+  }
+  return { x1, y1, x2, y2 };
+}
+function nodesOfSelection() {
+  let set = new Set();
+  for (let v of selection) {
+    for (let n of v.getNodes()) set.add(n);
+  }
+  return set;
+}
+
+// mouse thingys
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+canvas.addEventListener("mousedown", e => {
+  const sx = e.offsetX;
+  const sy = e.offsetY;
+  const world = screenToWorld(sx, sy);
+  const x = snap(world.x);
+  const y = snap(world.y);
+  lastMouse = { x, y };
+  // right mouse is panning
+  if (e.button === 2) {
+    panning = true;
+    panStart = { x: sx, y: sy, camX, camY };
+    return;
+  }
+  // delete mode
+  if (deleteMode) {
+    let wi = hitWireAt(x, y);
+    if (wi !== -1) {
+      wires.splice(wi, 1);
+      for (let n of nodes) n.group = n;
+      for (let w of wires) merge(w.a, w.b);
+      return;
+    }
+    for (let i = visuals.length - 1; i >= 0; i--) {
+      let v = visuals[i];
+      if (v.contains && v.contains(x, y)) {
+        visuals.splice(i, 1);
+        if (v.model instanceof Transistor) {
+          transistors.splice(transistors.indexOf(v.model), 1);
+          nodes = nodes.filter(n => n !== v.model.g && n !== v.model.s && n !== v.model.d);
+        } else if (v instanceof InputNodeVisual) {
+          nodes = nodes.filter(n => n !== v.n);
+        } else if (v.model instanceof Resistor) {
+          resistors.splice(resistors.indexOf(v.model), 1);
+          nodes = nodes.filter(n => n !== v.model.a && n !== v.model.b);
+        } else if (v instanceof VDDNodeVisual || v instanceof GNDNodeVisual) {
+		  nodes = nodes.filter(n => n !== v.n);
+		}
+        for (let n of nodes) n.group = n;
+        for (let w of wires) merge(w.a, w.b);
+        updateStatus();
+        return;
+      }
+    }
+    return;
+  }
+
+  // cancel wire placement if clicking empty space
+  if (wiringStart && !hitNodeAt(x, y)) {
+    wiringStart = null;
+    wirePreviewPos = null;
+    return;
+  }
+  // toggle input
+  for (let v of visuals) {
+    if (v instanceof InputNodeVisual && v.contains(x, y)) {
+      v.toggle();
+      return;
+    }
+  }
+  // wiring stuff ig
+  let n = hitNodeAt(x, y);
+  if (n) {
+    if (!wiringStart) {
+      wiringStart = n;
+      wirePreviewPos = { x, y };
+    } else {
+      let a = find(wiringStart);
+      let b = find(n);
+      if (a !== b) {
+        if (a.value !== "X" && b.value !== "X" && a.value !== b.value) {
+          // conflict: reject
+        } else {
+          merge(a, b);
+          wires.push({ a: wiringStart, b: n });
+        }
+      }
+      wiringStart = null;
+      wirePreviewPos = null;
+    }
+    return;
+  }
+  // selection / dragging
+  let v = hitVisualAt(x, y);
+  if (v) {
+    if (e.shiftKey) {
+      toggleSelection(v);
+    } else {
+      if (!selection.has(v)) {
+        clearSelection();
+        addToSelection(v);
+      }
+    }
+    dragging = v;
+    dragDX = x - v.x;
+    dragDY = y - v.y;
+  } else {
+    // start selection rectangle
+    clearSelection();
+    selectionRect = { x1: x, y1: y, x2: x, y2: y };
+  }
+});
+
+canvas.addEventListener("mousemove", e => {
+  const sx = e.offsetX;
+  const sy = e.offsetY;
+  const world = screenToWorld(sx, sy);
+  const x = snap(world.x);
+  const y = snap(world.y);
+  lastMouse = { x, y };
+  if (panning) {
+    camX = panStart.camX + (sx - panStart.x);
+    camY = panStart.camY + (sy - panStart.y);
+    return;
+  }
+  if (wiringStart) {
+    wirePreviewPos = { x, y };
+  }
+  if (selectionRect) {
+    selectionRect.x2 = x;
+    selectionRect.y2 = y;
+    return;
+  }
+  if (!dragging) return;
+  let dx = x - dragDX;
+  let dy = y - dragDY;
+  let offsetX = dx - dragging.x;
+  let offsetY = dy - dragging.y;
+  for (let v of selection) {
+    v.x = snap(v.x + offsetX);
+    v.y = snap(v.y + offsetY);
+    if (v instanceof TransistorVisual) v.updatePins();
+    if (v instanceof ResistorVisual) v.updatePins();
+    if (v instanceof InputNodeVisual) {
+      v.n.x = v.x;
+      v.n.y = v.y;
+    }
+	if (v instanceof VDDNodeVisual || v instanceof GNDNodeVisual) {
+	  v.updatePins();
+	}
+  }
+});
+
+canvas.addEventListener("mouseup", () => {
+  panning = false;
+  if (selectionRect) {
+    let r = selectionRect;
+    let x1 = Math.min(r.x1, r.x2);
+    let y1 = Math.min(r.y1, r.y2);
+    let x2 = Math.max(r.x1, r.x2);
+    let y2 = Math.max(r.y1, r.y2);
+    for (let v of visuals) {
+      let b = v.getBounds();
+      if (b.x1 >= x1 && b.y1 >= y1 && b.x2 <= x2 && b.y2 <= y2) {
+        addToSelection(v);
+      }
+    }
+    selectionRect = null;
+  }
+  dragging = null;
+});
+
+// wheel zoomy
+canvas.addEventListener("wheel", e => {
+  const sx = e.offsetX;
+  const sy = e.offsetY;
+  const before = screenToWorld(sx, sy);
+  if (e.deltaY < 0) camScale *= ZOOM_FACTOR;
+  else camScale /= ZOOM_FACTOR;
+  const after = screenToWorld(sx, sy);
+  camX += (after.x - before.x) * camScale;
+  camY += (after.y - before.y) * camScale;
+  e.preventDefault();
+}, { passive: false });
+
+// kb copy,paste,cut,delete
+document.addEventListener("keydown", e => {
+  // Delete key: delete selection
+  if (!e.ctrlKey && e.key === "Delete") {
+    e.preventDefault();
+    deleteSelection();
+    return;
+  }
+  if (!e.ctrlKey) return;
+  if (e.key === "c" || e.key === "C") {
+    e.preventDefault();
+    copySelection();
+  } else if (e.key === "x" || e.key === "X") {
+    e.preventDefault();
+    copySelection();
+    deleteSelection();
+  } else if (e.key === "v" || e.key === "V") {
+    e.preventDefault();
+    pasteClipboardAt(lastMouse.x, lastMouse.y);
+  }
+});
+
+// ====== CLIPBOARD ======
+function copySelection() {
+  if (selection.size === 0) { clipboard = null; return; }
+  let bounds = selectionBounds();
+  let cx = (bounds.x1 + bounds.x2) / 2;
+  let cy = (bounds.y1 + bounds.y2) / 2;
+
+  let items = [];
+  for (let v of selection) {
+    if (v instanceof TransistorVisual) {
+      items.push({ kind: "transistor", type: v.model.type, relX: v.x - cx, relY: v.y - cy });
+    } else if (v instanceof InputNodeVisual) {
+      items.push({ kind: "input", relX: v.x - cx, relY: v.y - cy, value: v.n.value });
+    } else if (v instanceof ResistorVisual) {
+      items.push({ kind: "resistor", relX: v.x - cx, relY: v.y - cy });
+    } else if (v instanceof VDDNodeVisual) {
+	  items.push({ kind: "vdd", relX: v.x - cx, relY: v.y - cy });
+    } else if (v instanceof GNDNodeVisual) {
+	  items.push({ kind: "gnd", relX: v.x - cx, relY: v.y - cy });
+	}
+  }
+  let selNodes = nodesOfSelection();
+  let wireSpecs = [];
+  for (let w of wires) {
+    if (selNodes.has(w.a) && selNodes.has(w.b)) {
+      wireSpecs.push({
+        ax: w.a.x - cx,
+        ay: w.a.y - cy,
+        bx: w.b.x - cx,
+        by: w.b.y - cy
+      });
+    }
+  }
+
+  clipboard = { cx, cy, items, wireSpecs };
+}
+
+function deleteSelection() {
+  if (selection.size === 0) return;
+  let selNodes = nodesOfSelection();
+  // delete visuals
+  visuals = visuals.filter(v => !selection.has(v));
+  // delete models
+  transistors = transistors.filter(t => {
+    return ![t.g, t.s, t.d].some(n => selNodes.has(n));
+  });
+  resistors = resistors.filter(r => {
+    return !(selNodes.has(r.a) || selNodes.has(r.b));
+  });
+  nodes = nodes.filter(n => !selNodes.has(n));
+  // delete wires touching selection
+  wires = wires.filter(w => !(selNodes.has(w.a) || selNodes.has(w.b)));
+  selection.clear();
+  for (let n of nodes) n.group = n;
+  for (let w of wires) merge(w.a, w.b);
+  updateStatus();
+}
+
+function pasteClipboardAt(x, y) {
+  if (!clipboard) return;
+  let { items, wireSpecs } = clipboard;
+  let bounds = { x1: Infinity, y1: Infinity, x2: -Infinity, y2: -Infinity };
+  for (let it of items) {
+    bounds.x1 = Math.min(bounds.x1, it.relX);
+    bounds.y1 = Math.min(bounds.y1, it.relY);
+    bounds.x2 = Math.max(bounds.x2, it.relX);
+    bounds.y2 = Math.max(bounds.y2, it.relY);
+  }
+  let cx = (bounds.x1 + bounds.x2) / 2;
+  let cy = (bounds.y1 + bounds.y2) / 2;
+  let offsetX = snap(x) - cx;
+  let offsetY = snap(y) - cy;
+  let newVisuals = [];
+  let allNodes = [];
+  for (let it of items) {
+    if (it.kind === "transistor") {
+      let g = new Node(), s = new Node(), d = new Node();
+      nodes.push(g, s, d);
+      let t = new Transistor(it.type, g, s, d);
+      transistors.push(t);
+      let v = new TransistorVisual(t, offsetX + it.relX, offsetY + it.relY);
+      visuals.push(v);
+      newVisuals.push(v);
+      allNodes.push(...v.getNodes());
+    } else if (it.kind === "input") {
+      let n = new Node();
+      n.value = it.value;
+      n.isInput = true;
+      nodes.push(n);
+      let v = new InputNodeVisual(n, offsetX + it.relX, offsetY + it.relY);
+      visuals.push(v);
+      newVisuals.push(v);
+      allNodes.push(...v.getNodes());
+    } else if (it.kind === "resistor") {
+      let a = new Node(), b = new Node();
+      nodes.push(a, b);
+      let r = new Resistor(a, b);
+      resistors.push(r);
+      let v = new ResistorVisual(r, offsetX + it.relX, offsetY + it.relY);
+      visuals.push(v);
+      newVisuals.push(v);
+      allNodes.push(...v.getNodes());
+    } else if (it.kind === "vdd") {
+	  let n = new Node();
+	  n.value = "1";
+	  n.isInput = true;
+	  nodes.push(n);
+	  let v = new VDDNodeVisual(n, offsetX + it.relX, offsetY + it.relY);
+	  visuals.push(v);
+	  newVisuals.push(v);
+	  allNodes.push(n);
+	} else if (it.kind === "gnd") {
+	  let n = new Node();
+	  n.value = "0";
+	  n.isInput = true;
+	  nodes.push(n);
+	  let v = new GNDNodeVisual(n, offsetX + it.relX, offsetY + it.relY);
+	  visuals.push(v);
+	  newVisuals.push(v);
+	  allNodes.push(n);
+	}
+  }
+
+  function findNearestNode(px, py) {
+    let best = null;
+    let bestD = Infinity;
+    for (let n of allNodes) {
+      let d = Math.hypot(px - n.x, py - n.y);
+      if (d < bestD) {
+        bestD = d;
+        best = n;
+      }
+    }
+    return best;
+  }
+
+  for (let ws of wireSpecs) {
+    let ax = offsetX + ws.ax;
+    let ay = offsetY + ws.ay;
+    let bx = offsetX + ws.bx;
+    let by = offsetY + ws.by;
+    let na = findNearestNode(ax, ay);
+    let nb = findNearestNode(bx, by);
+    if (!na || !nb || na === nb) continue;
+    let ra = find(na);
+    let rb = find(nb);
+    if (ra.value !== "X" && rb.value !== "X" && ra.value !== rb.value) {
+      continue;
+    }
+    merge(ra, rb);
+    wires.push({ a: na, b: nb });
+  }
+
+  clearSelection();
+  for (let v of newVisuals) selection.add(v);
+  updateStatus();
+}
+
+// serialisation for json save cuz why not
+function serializeCircuit() {
+  let components = [];
+  for (let v of visuals) {
+    if (v instanceof TransistorVisual) {
+      components.push({
+        kind: "transistor",
+        type: v.model.type,
+        x: v.x,
+        y: v.y
+      });
+    } else if (v instanceof InputNodeVisual) {
+      components.push({
+        kind: "input",
+        x: v.x,
+        y: v.y,
+        value: v.n.value
+      });
+    } else if (v instanceof ResistorVisual) {
+      components.push({
+        kind: "resistor",
+        x: v.x,
+        y: v.y
+      });
+    } else if (v instanceof VDDNodeVisual) {
+	  components.push({
+		kind: "vdd",
+		x: v.x,
+		y: v.y
+	  });
+	}
+	if (v instanceof GNDNodeVisual) {
+	  components.push({
+		kind: "gnd",
+		x: v.x,
+		y: v.y
+	  });
+	}
+  }
+
+  let wireSpecs = [];
+  for (let w of wires) {
+    wireSpecs.push({
+      ax: w.a.x,
+      ay: w.a.y,
+      bx: w.b.x,
+      by: w.b.y
+    });
+  }
+
+  return {
+    camera: { x: camX, y: camY, scale: camScale },
+    components,
+    wires: wireSpecs
+  };
+}
+
+function clearCircuit() {
+  nodes = [];
+  transistors = [];
+  resistors = [];
+  visuals = [];
+  wires = [];
+  selection.clear();
+  wiringStart = null;
+  wirePreviewPos = null;
+}
+
+function deserializeCircuit(data) {
+  clearCircuit();
+  if (data.camera) {
+    camX = data.camera.x || 0;
+    camY = data.camera.y || 0;
+    camScale = data.camera.scale || 1;
+  } else {
+    camX = 0; camY = 0; camScale = 1;
+  }
+  let allNodes = [];
+  if (Array.isArray(data.components)) {
+    for (let c of data.components) {
+      if (c.kind === "transistor") {
+        let g = new Node(), s = new Node(), d = new Node();
+        nodes.push(g, s, d);
+        let t = new Transistor(c.type || "nmos", g, s, d);
+        transistors.push(t);
+        let v = new TransistorVisual(t, c.x, c.y);
+        visuals.push(v);
+        allNodes.push(...v.getNodes());
+      } else if (c.kind === "input") {
+        let n = new Node();
+        n.value = c.value === "1" ? "1" : c.value === "0" ? "0" : "0";
+        n.isInput = true;
+        nodes.push(n);
+        let v = new InputNodeVisual(n, c.x, c.y);
+        visuals.push(v);
+        allNodes.push(...v.getNodes());
+      } else if (c.kind === "resistor") {
+        let a = new Node(), b = new Node();
+        nodes.push(a, b);
+        let r = new Resistor(a, b);
+        resistors.push(r);
+        let v = new ResistorVisual(r, c.x, c.y);
+        visuals.push(v);
+        allNodes.push(...v.getNodes());
+      } else if (c.kind === "vdd") {
+		  let n = new Node();
+		  n.value = "1";
+		  n.isInput = true;
+		  nodes.push(n);
+		  visuals.push(new VDDNodeVisual(n, c.x, c.y));
+		  allNodes.push(n);
+	  }
+	  if (c.kind === "gnd") {
+		  let n = new Node();
+		  n.value = "0";
+		  n.isInput = true;
+		  nodes.push(n);
+		  visuals.push(new GNDNodeVisual(n, c.x, c.y));
+		  allNodes.push(n);
+	  }
+    }
+  }
+
+  function findNearestNode(px, py) {
+    let best = null;
+    let bestD = Infinity;
+    for (let n of allNodes) {
+      let d = Math.hypot(px - n.x, py - n.y);
+      if (d < bestD) {
+        bestD = d;
+        best = n;
+      }
+    }
+    return best;
+  }
+  if (Array.isArray(data.wires)) {
+    for (let ws of data.wires) {
+      let na = findNearestNode(ws.ax, ws.ay);
+      let nb = findNearestNode(ws.bx, ws.by);
+      if (!na || !nb || na === nb) continue;
+      let ra = find(na);
+      let rb = find(nb);
+      if (ra.value !== "X" && rb.value !== "X" && ra.value !== rb.value) {
+        continue;
+      }
+      merge(ra, rb);
+      wires.push({ a: na, b: nb });
+    }
+  }
+  updateStatus();
+}
+
+document.getElementById("saveBtn").onclick = () => {
+  const data = serializeCircuit();
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "transistor_circuit.json";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+};
+
+const fileInput = document.getElementById("fileInput");
+document.getElementById("loadBtn").onclick = () => {
+  fileInput.value = "";
+  fileInput.click();
+};
+fileInput.addEventListener("change", () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const data = JSON.parse(e.target.result);
+      deserializeCircuit(data);
+    } catch (err) {
+      alert("Failed to load circuit: " + err);
+    }
+  };
+  reader.readAsText(file);
+});
+
+document.getElementById("addVDD").onclick = () => {
+  let n = new Node();
+  nodes.push(n);
+  visuals.push(new VDDNodeVisual(n, 120, 200));
+  updateStatus();
+};
+
+document.getElementById("addGND").onclick = () => {
+  let n = new Node();
+  nodes.push(n);
+  visuals.push(new GNDNodeVisual(n, 120, 240));
+  updateStatus();
+};
+
+// ====== BUTTON LISTENERS ======
+document.getElementById("deleteMode").onclick = () => {
+  deleteMode = !deleteMode;
+  document.getElementById("deleteMode").style.background =
+    deleteMode ? "#aa3333" : "#444444";
+};
+
+document.getElementById("addNMOS").onclick = () => {
+  let g = new Node(), s = new Node(), d = new Node();
+  nodes.push(g, s, d);
+  let t = new Transistor("nmos", g, s, d);
+  transistors.push(t);
+  visuals.push(new TransistorVisual(t, 200, 200));
+  updateStatus();
+};
+
+document.getElementById("addPMOS").onclick = () => {
+  let g = new Node(), s = new Node(), d = new Node();
+  nodes.push(g, s, d);
+  let t = new Transistor("pmos", g, s, d);
+  transistors.push(t);
+  visuals.push(new TransistorVisual(t, 240, 200));
+  updateStatus();
+};
+
+document.getElementById("addInput").onclick = () => {
+  let n = new Node();
+  nodes.push(n);
+  visuals.push(new InputNodeVisual(n, 160, 200));
+  updateStatus();
+};
+
+document.getElementById("addResistor").onclick = () => {
+  let a = new Node(), b = new Node();
+  nodes.push(a, b);
+  let r = new Resistor(a, b);
+  resistors.push(r);
+  visuals.push(new ResistorVisual(r, 300, 200));
+  updateStatus();
+};
+
+// loops
+function updateStatus() {
+  statusEl.textContent =
+    `Nodes: ${nodes.length}, T: ${transistors.length}, R: ${resistors.length}, W: ${wires.length}`;
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.save();
+  ctx.translate(camX, camY);
+  ctx.scale(camScale, camScale);
+  // grid
+  ctx.strokeStyle = "#222222";
+  const maxX = canvas.width / camScale;
+  const maxY = canvas.height / camScale;
+  for (let x = 0; x < maxX; x += GRID) {
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, maxY);
+    ctx.stroke();
+  }
+  for (let y = 0; y < maxY; y += GRID) {
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(maxX, y);
+    ctx.stroke();
+  }
+  // wires
+  ctx.strokeStyle = "#aaaaaa";
+  for (let w of wires) {
+    ctx.beginPath();
+    ctx.moveTo(w.a.x, w.a.y);
+    ctx.lineTo(w.b.x, w.b.y);
+    ctx.stroke();
+  }
+  // wire preview
+  if (wiringStart && wirePreviewPos) {
+    ctx.strokeStyle = "#5555ff";
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(wiringStart.x, wiringStart.y);
+    ctx.lineTo(wirePreviewPos.x, wirePreviewPos.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  // components
+  for (let v of visuals) v.draw(ctx);
+  // selection rectangle
+  if (selectionRect) {
+    let r = selectionRect;
+    let x1 = Math.min(r.x1, r.x2);
+    let y1 = Math.min(r.y1, r.y2);
+    let x2 = Math.max(r.x1, r.x2);
+    let y2 = Math.max(r.y1, r.y2);
+    ctx.strokeStyle = "#88aaff";
+    ctx.setLineDash([4, 4]);
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    ctx.setLineDash([]);
+  }
+  ctx.restore();
+  requestAnimationFrame(draw);
+}
+
+setInterval(() => {
+  simulate();
+  updateStatus();
+}, 30);
+
+draw();
+</script>
+
+</body>
+</html>
